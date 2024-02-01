@@ -1,12 +1,14 @@
-class Vehicle:
-    def __init__(self, vehicle_id, vehicle_type, origin, destination, departure_time):
-        self.vehicle_id = vehicle_id
-        self.vehicle_type = vehicle_type
+class Car:
+    def __init__(self, id, type, origin, destination, departure_time, length):
+        self.id = id
+        self.type = type
         self.origin = origin
         self.destination = destination
         self.departure_time = departure_time
+        self.length = length
         self.travel_distance = 0
         self.travel_time = 0
+        self.passengers = 0
         self.route = []
 
     def add_to_route(self, node):
