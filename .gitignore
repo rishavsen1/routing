@@ -6,3 +6,4 @@ src/__pycache__/
 src/cache/
 src/tmp
 .vscode
+src/output/

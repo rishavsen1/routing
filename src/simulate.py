@@ -6,6 +6,8 @@ from tqdm import tqdm
 import math
 import numpy as np
 from shapely.geometry import LineString
+from datetime import datetime, time
+import argparse
 
 pd.options.mode.chained_assignment = None  # default='warn'
 
@@ -189,10 +191,10 @@ def analyze_vehicle_data(vehicles):
     return vehicle_df
 
 
-def plot_and_save_vehicle_route(vehicle, road_network):
+def plot_and_save_vehicle_route(vehicle, road_network, output_path):
     fig, ax = plt.subplots()
     ox.plot_graph_route(road_network, vehicle.route, ax=ax, show=False, close=True)
-    plt.savefig(f"./outputs/car_{vehicle.vehicle_id}.png")
+    plt.savefig(f"{output_path}/car_{vehicle.vehicle_id}.png")
     plt.close(fig)
 
 
@@ -212,13 +214,13 @@ def calculate_segment_travel_times(vehicle, road_network):
     return travel_times
 
 
-def visualize_network(road_network, vehicles):
+def visualize_network(road_network, vehicles, output_path):
     # with Pool(processes=os.cpu_count()) as pool:
     #     pool.starmap(plot_and_save_vehicle_route, [(vehicle, road_network) for vehicle in vehicles])
 
     routes = [vehicle.route for vehicle in vehicles]
     fig, ax = ox.plot_graph_routes(road_network, routes, show=False, close=True)
-    plt.savefig(f"./outputs/all_cars.png")
+    plt.savefig(f"{output_path}/all_cars.png")
     plt.close(fig)
 
 
@@ -387,13 +389,27 @@ def parallel_map_linestring_to_osm(graph, linestrings):
     return osm_paths
 
 
-def load_gtfs(path):
-    trips_df = pd.read_csv(f"{path}/trips.txt")
+def load_gtfs(trips_df, path):
     stop_times_df = pd.read_csv(f"{path}/stop_times.txt")
     shapes_df = pd.read_csv(f"{path}/shapes.txt")
 
+    trips = trips_df["trip_id"].to_list()
+    stop_times_df = stop_times_df[stop_times_df["trip_id"].isin(trips)]
+
+    stop_times_df_copy = stop_times_df.copy()
+    stop_times_df_copy["arrival_time"] = pd.to_timedelta(stop_times_df_copy["arrival_time"])
+    stop_times_df_copy["arrival_time_secs"] = stop_times_df_copy["arrival_time"].dt.total_seconds()
+    stop_times_df_sorted = stop_times_df_copy.sort_values(by=["trip_id", "arrival_time"])
+
+    trip_travel_times = (
+        stop_times_df_sorted.groupby("trip_id")
+        .agg(start_time=("arrival_time_secs", "first"), end_time=("arrival_time_secs", "last"))
+        .reset_index()
+    )
+    trip_travel_times["trip_gtfs_duration"] = trip_travel_times["end_time"] - trip_travel_times["start_time"]
+
     return (
-        trips_df,
+        trip_travel_times,
         stop_times_df,
         shapes_df,
     )
@@ -430,12 +446,11 @@ def create_buses_from_gtfs(trips_df, stop_times_df, shapes_df, osm_paths):
     return buses
 
 
-def estimating_bus_usage(gtfs_path, od_with_tt_path, income_path):
-    income_df = pd.read_csv(income_path, index_col=0)
+def estimating_bus_micro_usage(gtfs_path, od_with_tt_path, income_path, output_path, use_bus, use_micro=False):
+    income_df = pd.read_csv(income_path, index_col=0).drop(["geometry"], axis=1)
     income_df["estimate"] = income_df["estimate"].astype(float)
 
     od_df = pd.read_csv(od_with_tt_path, index_col=0, low_memory=False)
-
     od_df = od_df[od_df["transit_time"] > od_df["drive_time"]]
     od_df = od_df[od_df["walk_time"] > od_df["drive_time"]]
     od_df = od_df[od_df["walk_time"] >= od_df["transit_time"]]
@@ -446,27 +461,20 @@ def estimating_bus_usage(gtfs_path, od_with_tt_path, income_path):
     max_income = income_df["estimate"].max()
     data["income_ratio"] = data["estimate"] / max_income
 
-    # Normalize travel times
     data["normalized_drive_time"] = data["drive_time"] / data["drive_time"].max()
     data["normalized_transit_time"] = data["transit_time"] / data["transit_time"].max()
+    data["transit_time_ratio"] = data["drive_time"] / data["transit_time"]
 
-    # Assign high penalty to missing bus times
-    high_penalty = 10  # Arbitrary high value; adjust as needed
+    high_penalty = 10
     data["normalized_transit_time"].fillna(high_penalty, inplace=True)
 
-    # Weights (tune these based on your specific needs or model calibration)
     income_weight = 0.5
-    transit_time_weight = -0.5  # Negative because shorter times should increase bus usage
-    drive_time_weight = 0.5
+    transit_time_ratio_weight = 0.5
 
-    # Calculate estimated bus usage probability
     data["bus_usage_probability"] = (
-        income_weight * data["income_ratio"]
-        + transit_time_weight * data["normalized_transit_time"]
-        + drive_time_weight * data["normalized_drive_time"]
+        income_weight * data["income_ratio"] + transit_time_ratio_weight * data["transit_time_ratio"]
     )
 
-    # Normalize probability to [0, 1] range
     data["bus_usage_probability"] = (data["bus_usage_probability"] - data["bus_usage_probability"].min()) / (
         data["bus_usage_probability"].max() - data["bus_usage_probability"].min()
     )
@@ -479,46 +487,77 @@ def estimating_bus_usage(gtfs_path, od_with_tt_path, income_path):
     stop_times_df = pd.read_csv(f"{gtfs_path}/stop_times.txt")
     stop_times_df = stop_times_df[stop_times_df["departure_time"] < "24:00:00"]
 
-    stop_times_df["arrival_time"] = pd.to_datetime(stop_times_df["arrival_time"], format="%H:%M:%S")
-    stop_times_df["departure_time"] = pd.to_datetime(stop_times_df["departure_time"], format="%H:%M:%S")
+    stop_times_df["arrival_time"] = pd.to_datetime(stop_times_df["arrival_time"])
+    stop_times_df["departure_time"] = pd.to_datetime(stop_times_df["departure_time"])
+    stop_times_df["arrival_time"] = stop_times_df["arrival_time"].dt.time
+    stop_times_df["departure_time"] = stop_times_df["departure_time"].dt.time
 
-    start_time = pd.to_datetime("06:00:00")
-    end_time = pd.to_datetime("10:00:00")
+    min_od_time = int(min(od_df.pickup_time_0_secs))
+    min_hour = int(min_od_time / 3600)
+    min_minute = int((min_od_time - min_hour * 3600) / 60)
 
-    relevant_trips = stop_times_df[
+    max_od_time = int(max(od_df.pickup_time_0_secs)) + 60
+    max_hour = int(max_od_time / 3600)
+    max_minute = int((max_od_time - max_hour * 3600) / 60)
+
+    start_time = time(hour=min_hour, minute=min_minute)
+    end_time = time(hour=max_hour, minute=max_minute)
+
+    relevant_stop_times = stop_times_df[
         (stop_times_df["arrival_time"] >= start_time) & (stop_times_df["departure_time"] <= end_time)
     ]
 
-    num_buses = relevant_trips["trip_id"].nunique()
-    route_buses = relevant_trips.merge(trips_df, on="trip_id", how="left")
+    relevant_trips = trips_df.loc[trips_df["trip_id"].isin(list(relevant_stop_times.trip_id.unique()))]
+    relevant_trips.to_csv(f"{output_path}/relevant_bus_trips.csv")
+
+    num_buses = relevant_stop_times["trip_id"].nunique()
+    route_buses = relevant_stop_times.merge(trips_df, on="trip_id", how="left")
     num_buses_per_route = route_buses.groupby("route_id")["trip_id"].nunique().reset_index(name="num_buses")
+
+    if use_micro:
+        total_ods = len(data)
+        target_micro_transit_users = 300
+        estimated_percentage_of_disabled_who_use_micro_transit = 0.3
+
+        required_disabled_percentage = target_micro_transit_users / (
+            total_ods * estimated_percentage_of_disabled_who_use_micro_transit
+        )
+        np.random.seed(42)
+        data["is_disabled"] = np.random.rand(total_ods) < required_disabled_percentage
 
     data = pd.merge(data, num_buses_per_route, left_on="route1", right_on="route_id", how="left")
     data["num_buses"].fillna(0, inplace=True)
-    data["bus_capacity"] = 50
+    data["bus_capacity"] = 32 * 0.75
     data["max_bus_capacity"] = data["bus_capacity"] * data["num_buses"]
-    # data["adjusted_bus_users"] = np.floor(data[["estimated_bus_users", "max_bus_capacity"]].min(axis=1))
-    data["random_number"] = np.random.rand(len(data))  # Generates a random number between 0 and 1 for each row
-    data["choice"] = np.where(data["random_number"] < data["bus_usage_probability"], "Bus", "Car")
-    data["micro_transit_eligible"] = np.where(
-        data["is_disabled"], np.random.rand(len(data)) < 0.3, False
-    )  # 30% of disabled population
-    data["choice"] = np.where(data["micro_transit_eligible"], "Micro-Transit", data["choice"])
-    data[data["choice"] == "Micro-Transit"].to_csv("outputs/micro-transit_users.csv")
+    data["random_number"] = np.random.rand(len(data))
 
-    # Count the initial number of bus users
-    bus_user_counts = data.groupby(["route_id", "choice"]).size().unstack(fill_value=0)
+    if use_bus:
+        data["choice"] = np.where(data["random_number"] < data["bus_usage_probability"], "Bus", "Car")
 
-    # Iterate over routes
-    for route_id, row in bus_user_counts.iterrows():
-        if row["Bus"] > data.loc[data["route_id"] == route_id, "max_bus_capacity"].values[0]:
-            # Too many bus users, need to adjust
-            excess = row["Bus"] - data.loc[data["route_id"] == route_id, "max_bus_capacity"].values[0]
-            bus_users = data[(data["route_id"] == route_id) & (data["choice"] == "Bus")]
-            drop_indices = bus_users.sample(n=int(excess)).index  # Randomly select excess users to switch to 'Car'
-            data.loc[drop_indices, "choice"] = "Car"
+    if use_micro:
+        # data["choice"] = np.where(data["use__transit_eligible"], "Micro-Transit", data["choice"])
+        data["micro_transit_eligible"] = np.where(data["is_disabled"], np.random.rand(len(data)) < 0.3, False)
+        data["choice"] = np.where(data["micro_transit_eligible"], "Micro-Transit", data["choice"])
+        data[data["choice"] == "Micro-Transit"].to_csv(f"{output_path}/micro-transit_users.csv")
 
-    return data
+    if use_bus or use_micro:
+        bus_user_counts = data.groupby(["route_id", "choice"]).size().unstack(fill_value=0)
+
+        for route_id, row in bus_user_counts.iterrows():
+            if row["Bus"] > data.loc[data["route_id"] == route_id, "max_bus_capacity"].values[0]:
+                excess = row["Bus"] - data.loc[data["route_id"] == route_id, "max_bus_capacity"].values[0]
+                bus_users = data[(data["route_id"] == route_id) & (data["choice"] == "Bus")]
+                drop_indices = bus_users.sample(n=int(excess)).index
+                data.loc[drop_indices, "choice"] = "Car"
+
+        data[data["choice"] == "Bus"].to_csv(f"{output_path}/bus_users.csv")
+        data[data["choice"] == "Car"].to_csv(f"{output_path}/car_users.csv")
+
+    else:
+        data["choice"] = "Car"
+        data.to_csv(f"{output_path}/car_users.csv")
+
+    return data, relevant_trips
 
 
 def process_micro_bus_route(args):
@@ -588,14 +627,59 @@ def create_micro_transit_buses(manifest_df, micro_bus_routes):
     return micro_transit_buses
 
 
+def remove_consecutive_duplicates(osm_paths):
+    for key in osm_paths:
+        current_list = osm_paths[key]
+        new_list = [
+            current_list[i] for i in range(len(current_list)) if i == 0 or current_list[i] != current_list[i - 1]
+        ]
+        osm_paths[key] = new_list
+    return osm_paths
+
+
+def calculate_adjustment(row, bus_trip_adjustment_dict, mean_adjustment, bus_gtfs_tt=None):
+    adjustments = []
+    for i in range(1, 7):
+        trip_key = f"trip{i}"
+        if pd.notnull(row[trip_key]):
+            trip_id_str = str(int(row[trip_key]))
+            if (trip_id_str in bus_gtfs_tt) and (trip_id_str in bus_trip_adjustment_dict):
+                gtfs_tt = bus_gtfs_tt[trip_id_str]
+                tt_to_gtfs_tt = row["transit_time"] / gtfs_tt
+                adjustments.append(bus_trip_adjustment_dict[trip_id_str] / tt_to_gtfs_tt)
+            else:
+                adjustments.append(mean_adjustment)
+
+    avg_adjustment = np.mean(adjustments) if adjustments else 1
+    return row["transit_time"] * avg_adjustment
+
+
 def main():
     total_simulation_time = 24 * 60 * 60
+    parser = argparse.ArgumentParser()
 
-    USING_TRANSIT = True
-    USING_MIRCO_TRANSIT = True
+    parser = argparse.ArgumentParser(description="Process transit options.")
+
+    parser.add_argument("-t", "--using-transit", dest="USING_TRANSIT", action="store_true", help="Flag to use transit")
+    parser.add_argument(
+        "-m",
+        "--using-micro-transit",
+        dest="USING_MICRO_TRANSIT",
+        action="store_true",
+        help="Flag to use micro transit",
+    )
+
+    parser.set_defaults(USING_TRANSIT=False, USING_MICRO_TRANSIT=False)
+
+    args = parser.parse_args()
+
+    USING_TRANSIT = args.USING_TRANSIT
+    USING_MIRCO_TRANSIT = args.USING_MICRO_TRANSIT
     area_name = "Hamilton County, Tennessee, USA"
-    os.makedirs("./outputs", exist_ok=True)
-    graph_save_filepath = f"./outputs/graph_{area_name}.png"
+
+    output_path = "./output/" + datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    os.makedirs(f"{output_path}", exist_ok=True)
+    graph_save_filepath = f"{output_path}/graph_{area_name}.png"
     graph, road_network = get_processed_network(area_name, graph_save_filepath)
     # graph_hash = add_graph_to_dict(graph)
 
@@ -603,94 +687,200 @@ def main():
     gtfs_path = "/home/rishav/Programs/routing/data/CARTA_GTFS2024"
 
     # use the
+    od_with_tt_path = "/home/rishav/Programs/routing/outputs/lodes_2021-01-05_transit_drive2.csv"
+    income_path = "/home/rishav/Programs/routing/data/income_tn_all.csv"
+    manifest_path = "/home/rishav/Programs/routing/data/micro_manifests/manifest_df.csv"  # from transit-webapp/notebooks/offline_optimizer.ipynb (pass the micro-transit users csv)
+    df_requests_path = "/home/rishav/Programs/routing/data/micro_manifests/df_requests.csv"
 
-    if USING_TRANSIT and USING_MIRCO_TRANSIT:
-        manifest_path = "/home/rishav/Programs/routing/data/micro_manifests/manifest_df.csv"  # from transit-webapp/notebooks/offline_optimizer.ipynb (pass the micro-transit users csv)
-        df_requests_path = "/home/rishav/Programs/routing/data/micro_manifests/df_requests.csv"
+    ods, relevant_trips = estimating_bus_micro_usage(
+        gtfs_path,
+        od_with_tt_path,
+        income_path,
+        output_path,
+        use_bus=USING_TRANSIT,
+        use_micro=USING_MIRCO_TRANSIT,
+    )
 
-        od_with_tt_path = "/home/rishav/Programs/routing/outputs/lodes_2021-01-05_transit_drive2.csv"
-        income_path = "/home/rishav/Programs/routing/data/income_tn_all.csv"
-        ods = estimating_bus_usage(gtfs_path, od_with_tt_path, income_path)
+    trip_travel_times, stop_times_df, shapes_df = load_gtfs(relevant_trips, gtfs_path)
+    trip_travel_times["trip_id"] = trip_travel_times["trip_id"].astype(str)
+    linestrings = parse_shapes_to_linestrings(shapes_df)
+    osm_paths = parallel_map_linestring_to_osm(graph, linestrings)
+    osm_paths = remove_consecutive_duplicates(osm_paths)
+    osm_df = pd.DataFrame(list(osm_paths.items()), columns=["shapes", "osm_nodes"])
+    osm_df.to_csv(f"{output_path}/shape_osm_nodes.csv")
+
+    if not USING_MIRCO_TRANSIT:
         ods_using_car = ods[ods["choice"] == "Car"]
-
-        od_pairs = load_od_pairs(ods_using_car)
-
-        trips_df, stop_times_df, shapes_df = load_gtfs(gtfs_path)
-        linestrings = parse_shapes_to_linestrings(shapes_df)
-        osm_paths = parallel_map_linestring_to_osm(graph, linestrings)
-        buses = create_buses_from_gtfs(trips_df, stop_times_df, shapes_df, osm_paths)
-
-        manifest_df = pd.read_csv(manifest_path)
-        micro_bus_routes = parallel_process_micro_bus_route(graph, manifest_df, df_requests_path)
-        micro_transit_buses = create_micro_transit_buses(manifest_df, micro_bus_routes)
-
-        initialize_road_usage(road_network, total_simulation_time)
-        vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
-        vehicles.extend(buses)
-        vehicles.extend(micro_transit_buses)
-
-    elif USING_TRANSIT:
-        od_with_tt_path = "/home/rishav/Programs/routing/outputs/lodes_2021-01-05_transit_drive2.csv"
-        income_path = "/home/rishav/Programs/routing/data/income_tn_all.csv"
-        ods = estimating_bus_usage(gtfs_path, od_with_tt_path, income_path)
-        ods_using_car = ods[ods["choice"] == "Car"]
-
-        od_pairs = load_od_pairs(ods_using_car)
-
-        trips_df, stop_times_df, shapes_df = load_gtfs(gtfs_path)
-        linestrings = parse_shapes_to_linestrings(shapes_df)
-        osm_paths = parallel_map_linestring_to_osm(graph, linestrings)
-        buses = create_buses_from_gtfs(trips_df, stop_times_df, shapes_df, osm_paths)
-
-        initialize_road_usage(road_network, total_simulation_time)
-        vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
-        vehicles.extend(buses)
-
-    elif USING_MIRCO_TRANSIT:
-        od_with_tt_path = "/home/rishav/Programs/routing/outputs/lodes_2021-01-05_transit_drive2.csv"
-        income_path = "/home/rishav/Programs/routing/data/income_tn_all.csv"
-        ods = estimating_bus_usage(gtfs_path, od_with_tt_path, income_path)
+    else:
         ods_using_car = ods[ods["choice"] != "Micro-Transit"]
 
-        od_pairs = load_od_pairs(ods_using_car)
+    od_pairs = load_od_pairs(ods_using_car)
 
+    initialize_road_usage(road_network, total_simulation_time)
+    vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+
+    if USING_TRANSIT:
+        buses = create_buses_from_gtfs(relevant_trips, stop_times_df, shapes_df, osm_paths)
+        vehicles.extend(buses)
+
+    if USING_MIRCO_TRANSIT:
         manifest_df = pd.read_csv(manifest_path)
         micro_bus_routes = parallel_process_micro_bus_route(graph, manifest_df, df_requests_path)
-        micro_transit_buses = create_micro_transit_buses(manifest_df, micro_bus_routes)
+        micro_bus_routes = remove_consecutive_duplicates(micro_bus_routes)
+        osm_df = pd.DataFrame(list(osm_paths.items()), columns=["shapes", "osm_nodes"])
+        osm_df.to_csv(f"{output_path}/micro_transit_nodes.csv")
 
-        initialize_road_usage(road_network, total_simulation_time)
-        vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+        micro_transit_buses = create_micro_transit_buses(manifest_df, micro_bus_routes)
         vehicles.extend(micro_transit_buses)
 
-    else:
-        od_with_tt_path = "/home/rishav/Programs/routing/outputs/lodes_2021-01-05_transit_drive2.csv"
-        income_path = "/home/rishav/Programs/routing/data/income_tn_all.csv"
-        ods = estimating_bus_usage(gtfs_path, od_with_tt_path, income_path)
-        ods_using_car = ods
+        micro_trip_travel_times = (
+            manifest_df.groupby("run_id")
+            .agg(start_time=("scheduled_time", "first"), end_time=("scheduled_time", "last"))
+            .reset_index()
+        )
 
-        od_pairs = load_od_pairs(ods_using_car)
+    # if USING_TRANSIT and USING_MIRCO_TRANSIT:
 
-        initialize_road_usage(road_network, total_simulation_time)
-        vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+    #     ods = estimating_bus_micro_usage(
+    #         gtfs_path,
+    #         od_with_tt_path,
+    #         income_path,
+    #         output_path,
+    #         use_bus=USING_MIRCO_TRANSIT,
+    #         use_micro=USING_MIRCO_TRANSIT,
+    #     )
+    #     ods_using_car = ods[ods["choice"] == "Car"]
+
+    #     od_pairs = load_od_pairs(ods_using_car)
+
+    #     trips_df, stop_times_df, shapes_df = load_gtfs(gtfs_path)
+    #     linestrings = parse_shapes_to_linestrings(shapes_df)
+    #     osm_paths = parallel_map_linestring_to_osm(graph, linestrings)
+    #     buses = create_buses_from_gtfs(trips_df, stop_times_df, shapes_df, osm_paths)
+
+    #     manifest_df = pd.read_csv(manifest_path)
+    #     micro_bus_routes = parallel_process_micro_bus_route(graph, manifest_df, df_requests_path)
+    #     micro_transit_buses = create_micro_transit_buses(manifest_df, micro_bus_routes)
+
+    #     initialize_road_usage(road_network, total_simulation_time)
+    #     vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+    #     vehicles.extend(buses)
+    #     vehicles.extend(micro_transit_buses)
+
+    # elif USING_TRANSIT:
+    #     ods = estimating_bus_micro_usage(
+    #         gtfs_path,
+    #         od_with_tt_path,
+    #         income_path,
+    #         output_path,
+    #         use_bus=USING_MIRCO_TRANSIT,
+    #         use_micro=USING_MIRCO_TRANSIT,
+    #     )
+    #     ods_using_car = ods[ods["choice"] == "Car"]
+
+    #     od_pairs = load_od_pairs(ods_using_car)
+
+    #     trips_df, stop_times_df, shapes_df = load_gtfs(gtfs_path)
+    #     linestrings = parse_shapes_to_linestrings(shapes_df)
+    #     osm_paths = parallel_map_linestring_to_osm(graph, linestrings)
+    #     buses = create_buses_from_gtfs(trips_df, stop_times_df, shapes_df, osm_paths)
+
+    #     initialize_road_usage(road_network, total_simulation_time)
+    #     vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+    #     vehicles.extend(buses)
+
+    # elif USING_MIRCO_TRANSIT:
+    #     ods = estimating_bus_micro_usage(
+    #         gtfs_path,
+    #         od_with_tt_path,
+    #         income_path,
+    #         output_path,
+    #         use_bus=USING_MIRCO_TRANSIT,
+    #         use_micro=USING_MIRCO_TRANSIT,
+    #     )
+    #     ods_using_car = ods[ods["choice"] != "Micro-Transit"]
+
+    #     od_pairs = load_od_pairs(ods_using_car)
+
+    #     manifest_df = pd.read_csv(manifest_path)
+    #     micro_bus_routes = parallel_process_micro_bus_route(graph, manifest_df, df_requests_path)
+    #     micro_transit_buses = create_micro_transit_buses(manifest_df, micro_bus_routes)
+
+    #     initialize_road_usage(road_network, total_simulation_time)
+    #     vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
+    #     vehicles.extend(micro_transit_buses)
+
+    # else:
+    #     ods = estimating_bus_micro_usage(
+    #         gtfs_path,
+    #         od_with_tt_path,
+    #         income_path,
+    #         output_path,
+    #         use_bus=USING_MIRCO_TRANSIT,
+    #         use_micro=USING_MIRCO_TRANSIT,
+    #     )
+    #     ods_using_car = ods
+
+    #     od_pairs = load_od_pairs(ods_using_car)
+
+    #     initialize_road_usage(road_network, total_simulation_time)
+    #     vehicles = assign_vehicles_parallel(graph, road_network, od_pairs, num_processes=os.cpu_count())
 
     travel_times = simulate_traffic(road_network, vehicles, total_simulation_time)
     vehicle_df = analyze_vehicle_data(vehicles)
-    vehicle_df.to_csv("./outputs/vehicles.csv")
+    vehicle_df["trip_id"] = vehicle_df["Vehicle ID"].apply(lambda x: x.split("_")[1])
+
+    trip_travel_times["trip_id"] = trip_travel_times["trip_id"].astype(int).astype(str)
+    merged_trip_travel_times = trip_travel_times.merge(vehicle_df[vehicle_df["Type"] == "bus"])
+    merged_trip_travel_times["adjustment_ratio"] = (
+        merged_trip_travel_times["Travel Time (seconds)"] / merged_trip_travel_times["trip_gtfs_duration"]
+    )
+
+    bus_gtfs_tt = merged_trip_travel_times.set_index("trip_id")["trip_gtfs_duration"].to_dict()
+
+    if USING_TRANSIT:
+        vehicle_df["trip_id"] = vehicle_df["Vehicle ID"].apply(lambda x: x.split("_")[1])
+        vehicle_df = vehicle_df.merge(trip_travel_times, on="trip_id", how="left")
+        vehicle_df["trip_gtfs_duration"] = vehicle_df["trip_gtfs_duration"].fillna(vehicle_df["Travel Time (seconds)"])
+        vehicle_df["adjustment_ratio"] = vehicle_df["trip_gtfs_duration"] / vehicle_df["Travel Time (seconds)"]
+        vehicle_df.to_csv(f"{output_path}/vehicles.csv")
+
+        bus_trip_adjustment_dict = merged_trip_travel_times.set_index("trip_id")["adjustment_ratio"].to_dict()
+        mean_adjustment = np.array(list(bus_trip_adjustment_dict.values())).mean()
+        ods["transit_time"] = ods.apply(
+            lambda row: calculate_adjustment(row, bus_trip_adjustment_dict, mean_adjustment, bus_gtfs_tt), axis=1
+        )
+
+        ods[ods["choice"] == "Bus"].to_csv(f"{output_path}/bus_users.csv")
+
+    if USING_MIRCO_TRANSIT:
+        micro_trip_travel_times = micro_trip_travel_times.merge(vehicle_df[vehicle_df["Type"] == "micro-transit"])
+        micro_trip_travel_times["adjustment_ratio"] = (
+            micro_trip_travel_times["Travel Time (seconds)"] / micro_trip_travel_times["trip_gtfs_duration"]
+        )
+        micro_trip_adjustment_dict = merged_trip_travel_times.set_index("trip_id")["adjustment_ratio"].to_dict()
+        mean_adjustment = np.array(list(micro_trip_adjustment_dict.values())).mean()
+        ods["transit_time"] = ods.apply(
+            lambda row: calculate_adjustment(row, micro_trip_adjustment_dict, mean_adjustment), axis=1
+        )
+
+        ods[ods["choice"] == "Micro-Transit"].to_csv(f"{output_path}/micro_transit_users.csv")
+
     # for vehicle in vehicles:
     #     travel_times = calculate_segment_travel_times(vehicle, road_network)
     #     update_road_usage(road_network, vehicle.route, vehicle.departure_time, travel_times)
 
     congestion_data = calculate_congestion(road_network, total_simulation_time)
     fig = visualize_congestion(road_network, congestion_data)
-    fig.savefig(f"./outputs/graph_{area_name}_congestion.png", dpi=300)
-    fig.savefig(f"./outputs/graph_{area_name}_congestion.svg")
+    fig.savefig(f"{output_path}/graph_{area_name}_congestion.png", dpi=300)
+    fig.savefig(f"{output_path}/graph_{area_name}_congestion.svg")
 
     congestion_df = pd.DataFrame.from_dict(congestion_data, orient="index", columns=["congestion_value"])
     congestion_df.reset_index(inplace=True)
     congestion_df[["start", "end"]] = pd.DataFrame(congestion_df["index"].tolist(), index=congestion_df.index)
     congestion_df.drop("index", axis=1, inplace=True)
     congestion_df.columns = ["congestion_value", "start", "end"]
-    congestion_df.to_csv(f"./outputs/congestion.csv")
+    congestion_df.to_csv(f"{output_path}/congestion.csv")
 
     vehicles_data = []
     for vehicle in vehicles:
@@ -702,7 +892,7 @@ def main():
         }
         vehicles_data.append(vehicle_info)
     vehicles_df = pd.DataFrame(vehicles_data)
-    vehicles_df.to_csv("./outputs/vehicles_routes.csv", index=False)
+    vehicles_df.to_csv(f"{output_path}/vehicles_routes.csv", index=False)
 
 
 if __name__ == "__main__":
